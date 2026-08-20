@@ -13,4 +13,4 @@ langchain-text-splitters
 sentence-transformers
 streamlit
 requests
-psycopg2-binary
+psycopg2-binarylangchain-classic
