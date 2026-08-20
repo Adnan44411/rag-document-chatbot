@@ -31,7 +31,7 @@ try:
     """)
 
     conn.commit()
-    cur.close()
+    cursor.close()
 
     print("Tables created successfully.")
 
