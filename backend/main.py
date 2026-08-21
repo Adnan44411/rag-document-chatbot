@@ -1,22 +1,26 @@
 import os
 import psycopg2
+
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-# RAG Imports
+from fastembed import TextEmbedding
+
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
+
 from langchain_classic.chains import create_retrieval_chain
 from langchain_classic.chains.combine_documents import create_stuff_documents_chain
+
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.messages import HumanMessage, AIMessage
 
 
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# ENVIRONMENT
 # ============================================================
 
 load_dotenv()
@@ -24,19 +28,17 @@ load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not GEMINI_API_KEY:
-    raise ValueError("GEMINI_API_KEY is not set in .env")
-
 if not DB_URL:
     raise ValueError("DATABASE_URL is not set in .env")
 
-
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY is not set in .env")
 
 os.environ["GEMINI_API_KEY"] = GEMINI_API_KEY
 
 
 # ============================================================
-# DATABASE CONNECTION
+# DATABASE
 # ============================================================
 
 def get_db_conn():
@@ -44,16 +46,34 @@ def get_db_conn():
 
 
 # ============================================================
+# FASTEMBED WRAPPER
+# ============================================================
+
+class FastEmbedEmbeddings(Embeddings):
+
+    def __init__(self):
+        self.model = TextEmbedding(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
+    def embed_documents(self, texts):
+        return [vector.tolist() for vector in self.model.embed(texts)]
+
+    def embed_query(self, text):
+        return next(self.model.embed([text])).tolist()
+
+
+# ============================================================
 # RAG SETUP
 # ============================================================
 
-FAISS_PATH = "../faiss_index/"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-print("Loading embeddings...")
+FAISS_PATH = os.path.join(BASE_DIR, "faiss_index")
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+print("Loading FastEmbed...")
+
+embeddings = FastEmbedEmbeddings()
 
 print("Loading FAISS index...")
 
@@ -63,16 +83,24 @@ db = FAISS.load_local(
     allow_dangerous_deserialization=True
 )
 
-print("Loading Gemini...")
-
-llm = ChatGoogleGenerativeAI(
-    model="gemini-3.6-flash",
-    temperature=0.7
-)
+print("FAISS index loaded successfully.")
 
 retriever = db.as_retriever(
     search_kwargs={"k": 3}
 )
+
+
+# ============================================================
+# GEMINI
+# ============================================================
+
+print("Loading Gemini...")
+
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.6-flash"
+)
+
+print("Gemini loaded.")
 
 
 # ============================================================
@@ -119,11 +147,11 @@ rag_chain = create_retrieval_chain(
     qa_chain
 )
 
-print("RAG chain created.")
+print("RAG chain created successfully.")
 
 
 # ============================================================
-# FASTAPI APP
+# FASTAPI
 # ============================================================
 
 app = FastAPI()
@@ -160,13 +188,14 @@ class UserRequest(BaseModel):
 
 
 # ============================================================
-# ROOT ENDPOINT
+# ROOT
 # ============================================================
 
 @app.get("/")
 def read_root():
     return {
-        "message": "Welcome to FastAPI. Go to /docs to get started."
+        "message": "RAG Chatbot API is running",
+        "docs": "/docs"
     }
 
 
@@ -182,10 +211,6 @@ def get_or_create_user(req: UserRequest):
 
     try:
 
-        # ----------------------------------------------------
-        # 1. Check if username already exists
-        # ----------------------------------------------------
-
         cur.execute(
             """
             SELECT id, username, email
@@ -197,23 +222,13 @@ def get_or_create_user(req: UserRequest):
 
         user_row = cur.fetchone()
 
-        # ----------------------------------------------------
-        # 2. Existing user
-        # ----------------------------------------------------
-
         if user_row:
 
-            user_id = user_row[0]
-
             return {
-                "user_id": user_id,
+                "user_id": user_row[0],
                 "username": user_row[1],
                 "email": user_row[2]
             }
-
-        # ----------------------------------------------------
-        # 3. Create new user
-        # ----------------------------------------------------
 
         cur.execute(
             """
@@ -269,10 +284,6 @@ def get_history(req: HistoryRequest):
 
         history = cur.fetchall()
 
-        # ----------------------------------------------------
-        # Format history for frontend
-        # ----------------------------------------------------
-
         formatted_history = []
 
         for prompt_text, answer in history:
@@ -314,7 +325,27 @@ def query_rag(req: QueryRequest):
     try:
 
         # ----------------------------------------------------
-        # 1. Get previous conversation history
+        # Check that user exists
+        # ----------------------------------------------------
+
+        cur.execute(
+            """
+            SELECT id
+            FROM users
+            WHERE id = %s
+            """,
+            (req.user_id,)
+        )
+
+        user = cur.fetchone()
+
+        if not user:
+            return {
+                "error": "User does not exist. Please login again."
+            }
+
+        # ----------------------------------------------------
+        # Get chat history
         # ----------------------------------------------------
 
         cur.execute(
@@ -330,7 +361,7 @@ def query_rag(req: QueryRequest):
         db_history = cur.fetchall()
 
         # ----------------------------------------------------
-        # 2. Convert database history into LangChain messages
+        # Convert history to LangChain messages
         # ----------------------------------------------------
 
         chat_history_messages = []
@@ -338,19 +369,15 @@ def query_rag(req: QueryRequest):
         for prompt_text, answer in db_history:
 
             chat_history_messages.append(
-                HumanMessage(
-                    content=prompt_text
-                )
+                HumanMessage(content=prompt_text)
             )
 
             chat_history_messages.append(
-                AIMessage(
-                    content=answer
-                )
+                AIMessage(content=answer)
             )
 
         # ----------------------------------------------------
-        # 3. Run RAG
+        # Run RAG
         # ----------------------------------------------------
 
         response = rag_chain.invoke(
@@ -366,7 +393,7 @@ def query_rag(req: QueryRequest):
         )
 
         # ----------------------------------------------------
-        # 4. Save Q&A into PostgreSQL
+        # Save chat
         # ----------------------------------------------------
 
         cur.execute(
@@ -384,10 +411,6 @@ def query_rag(req: QueryRequest):
 
         conn.commit()
 
-        # ----------------------------------------------------
-        # 5. Return answer
-        # ----------------------------------------------------
-
         return {
             "answer": answer
         }
@@ -401,3 +424,4 @@ def query_rag(req: QueryRequest):
 
         cur.close()
         conn.close()
+        
